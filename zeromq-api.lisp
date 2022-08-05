@@ -1,12 +1,7 @@
-;; Copyright (c) 2009, 2010 Vitaly Mayatskikh <v.mayatskih@gmail.com>
-;;
-;; This file is part of CL-ZMQ.
-;;
-;; Vitaly Mayatskikh grants you the rights to distribute
-;; and use this software as governed by the terms
-;; of the Lisp Lesser GNU Public License
-;; (http://opensource.franz.com/preamble.html),
-;; known as the LLGPL.
+;;;; @Author: Samuel Hill
+;;;; @Date:   2021-04-28 11:23:46
+;;;; @Last Modified by:   Samuel Hill
+;;;; @Last Modified time: 2021-05-07 01:35:56
 
 (in-package :zeromq)
 
@@ -14,12 +9,12 @@
   (require :defsubst))
 
 (defcfun ("memcpy" memcpy) :pointer
-  (dst	:pointer)
-  (src	:pointer)
-  (len	:long))
+  (dst  :pointer)
+  (src  :pointer)
+  (len  :long))
 
 (defclass msg ()
-  ((raw		:accessor msg-raw :initform nil)))
+  ((raw :accessor msg-raw :initform nil)))
 
 (defmethod initialize-instance :after ((msg msg) &key size data)
   (let ((obj (ff:allocate-fobject '%msg :c)))
@@ -50,7 +45,7 @@
                     (map nil (lambda (x)
                                (setf (mem-aref ptr :uchar (incf i)) x))
                          data))))))
-	  (t (msg-init obj)))))
+      (t (%msg-init obj)))))
 
 (excl::defsubst msg-init-size (msg size)
   (%msg-init-size (msg-raw msg) size))
@@ -79,42 +74,55 @@
   (let ((data (%msg-data (msg-raw msg))))
     (unless (zerop data)
       (let* ((len (msg-size msg))
-	     (array (or array (make-array len :element-type '(unsigned-byte 8)))))
+         (array (or array (make-array len :element-type '(unsigned-byte 8)))))
         (dotimes (i len)
           (setf (aref array i) (sys:memref-int data 0 i :unsigned-byte)))
         array))))
 
 (defun bind (s address)
-  (with-foreign-string (addr address)
+  (excl:with-native-string (addr address :external-format :ascii)
     (%bind s addr)))
 
 (defun connect (s address)
-  (with-foreign-string (addr address)
+  (excl:with-native-string (addr address :external-format :ascii)
     (%connect s addr)))
 
-(defmacro with-context ((context io-threads) &body body)
-  `(let ((,context (init ,io-threads)))
+(defun init-context (&optional (io-threads 1))
+  (%init io-threads))
+
+(defun term-context (context)
+  (%term context))
+
+(defmacro with-context ((context &optional (io-threads 1)) &body body)
+  `(let ((,context (%init ,io-threads)))
      (unwind-protect
-	  (progn ,@body)
-       (term ,context))))
+      (progn ,@body)
+       (%term ,context))))
+
+(defun open-socket (context type)
+  (%zmq_socket context (lookup-constant type)))
+
+(defun close-socket (socket)
+  (%zmq_close socket))
 
 (defmacro with-socket ((socket context type) &body body)
-  `(let ((,socket (zmq_socket ,context ,(lookup-constant type))))
+  `(let ((,socket (%zmq_socket ,context ,(lookup-constant type))))
      (unwind-protect
-	  (progn ,@body)
-       (zmq_close ,socket))))
+      (progn ,@body)
+       (%zmq_close ,socket))))
 
 (defmacro with-sockets (sockets &body body)
   (loop for (socket context type) in sockets
-     collect `(,socket (zmq_socket ,context ,(lookup-constant type))) into bindings
-     collect `(zmq_close ,socket) into cleanup
+     collect `(,socket (%zmq_socket ,context ,(lookup-constant type))) into bindings
+     collect `(%zmq_close ,socket) into cleanup
      finally (return `(let ,bindings
                         (unwind-protect
                              (progn ,@body)
                           (progn ,@cleanup))))))
 
 (defun send (s msg &optional flags)
-  (%send s (msg-raw msg) (or flags 0)))
+  (excl:with-native-string (str msg :external-format :ascii :native-length-var n)
+    (%send s str n (or flags 0))))
 
 (defun recv (s msg &optional flags)
   (%recv s (msg-raw msg) (or flags 0)))
@@ -133,7 +141,7 @@
   (ff:with-static-fobjects ((opt :long)
                             (len :long))
     (setf (ff:fslot-value opt) 0
-	  (ff:fslot-value len) (ff:sizeof-fobject :long))
+      (ff:fslot-value len) (ff:sizeof-fobject :long))
     (%getsockopt socket option opt len)
     (ff:fslot-value opt :long)))
 
@@ -197,8 +205,6 @@
                            (patch :int))
     (%version major minor patch)
     (format nil "~d.~d.~d"
-	    (ff:fslot-value major)
-	    (ff:fslot-value minor)
-	    (ff:fslot-value patch))))
-
-;
+        (ff:fslot-value major)
+        (ff:fslot-value minor)
+        (ff:fslot-value patch))))

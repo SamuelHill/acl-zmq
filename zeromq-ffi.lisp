@@ -1,19 +1,92 @@
-;; Copyright (c) 2009, 2010 Vitaly Mayatskikh <v.mayatskih@gmail.com>
-;;
-;; This file is part of CL-ZMQ.
-;;
-;; Vitaly Mayatskikh grants you the rights to distribute
-;; and use this software as governed by the terms
-;; of the Lisp Lesser GNU Public License
-;; (http://opensource.franz.com/preamble.html),
-;; known as the LLGPL.
+;;;; @Author: Samuel Hill
+;;;; @Date:   2021-03-12 12:45:13
+;;;; @Last Modified by:   Samuel Hill
+;;;; @Last Modified time: 2021-04-30 12:25:00
 
 (in-package :zeromq)
 
-#-:macosx
-(load "libzmq.so")
-#+:macosx
-(load "libzmq.dylib" :foreign t)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                Allegro specific setup for accessing foreign functions                 ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun map-type (type &rest args)
+  (let ((type (if (and (listp type)
+                       (eq 'quote (first type)))
+                  (second type)
+                  type)))
+    (cond
+      ((eq type :pointer)
+       `(* ,(or (first args) :void)))
+      ((listp type)
+       (assert (eql :pointer (first type)) () "expected :pointer, got ~A" (first type))
+       `(* ,(map-type (second type))))
+      (t
+       (case type
+         #+64bit
+         (:int64
+          :long)
+         (:uchar
+          :unsigned-char)
+         (t
+          type))))))
+
+(defun map-argument (argument)
+  (destructuring-bind (name type &rest args) argument
+    (list name
+          (cond
+            ((eq :count (first args))
+             `(:array ,(map-type type) ,(second args)))
+            ((eq :pointer (first args))
+             `(* ,(or (second args) :void)))
+            (t
+             (apply #'map-type type args))))))
+
+(defmacro defcfun ((c-name lisp-name) return-type &rest arguments)
+  `(ff:def-foreign-call (,lisp-name ,c-name)
+       ,(mapcar #'map-argument arguments)
+     :returning (,(map-type return-type))
+     :strings-convert nil))
+
+(defmacro defcfun* ((c-name lisp-name) return-type &rest arguments)
+  (let ((lisp-stub-name (intern (format nil "%~A" lisp-name) :zeromq))
+        (argument-names (mapcar #'first arguments))
+        (return-value (gensym)))
+    `(progn
+       (ff:def-foreign-call (,lisp-stub-name ,c-name)
+           ,(mapcar #'map-argument arguments)
+         :returning (,(map-type return-type))
+         :strings-convert nil
+         :error-value :errno)
+       (defun ,lisp-name ,argument-names
+         (multiple-value-bind (,return-value errno) (,lisp-stub-name ,@argument-names)
+           (if ,(if (eq return-type :pointer)
+                    `(zerop ,return-value)
+                    `(minusp ,return-value))
+               (if (eql errno excl::*eagain*)
+                   (error 'error-again)
+                   (error 'zmq-syscall-error :call-name ,c-name :errno errno))
+               ,return-value))))))
+
+(defmacro defcstruct (name &rest args)
+  `(ff:def-foreign-type ,name (:struct ,@(mapcar #'map-argument args))))
+
+(defmacro defcallback (name return-type args &body body)
+  (assert (eq :void return-type))
+  `(ff:defun-foreign-callable ,name ,(mapcar #'map-argument args)
+     ,@body))
+
+(defmacro with-foreign-string ((c-string lisp-string) &body body)
+  `(let ((,c-string (excl:string-to-native ,lisp-string)))
+     (unwind-protect
+          (progn ,@body)
+       (excl:aclfree ,c-string))))
+
+(defmacro with-foreign-slots ((slots address type) &body body)
+  (flet
+      ((gen-slot-accessor (slot-name)
+         `(,slot-name (ff:fslot-value-typed ',type :c ,address ',slot-name))))
+    `(symbol-macrolet ,(mapcar #'gen-slot-accessor slots)
+       ,@body)))
 
 (defvar *named-constants* nil)
 
@@ -34,9 +107,9 @@
   (or (cdr (assoc name *named-constants*))
       (error "invalid named constant ~A" name)))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;  0MQ errors.
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                      0MQ errors                                       ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defconstant +hausnumero+ 156384712)
 
@@ -46,7 +119,7 @@
 (defconstant* +enocompatproto+ (+ +hausnumero+ 52))
 
 (defcfun ("zmq_strerror" %strerror) :pointer
-  (errnum	:int))
+  (errnum :int))
 
 (define-condition error-again (error)
   ())
@@ -58,9 +131,9 @@
                      (error-call-name c)
                      (excl:native-to-string (%strerror (excl:syscall-error-errno c)))))))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;  0MQ message definition.
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                0MQ message definition                                 ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defconstant* +max-vsm-size+ 30)
 
@@ -76,59 +149,59 @@
 (defconstant* +msg-shared+ 128)
 
 (defcstruct %msg
-  (content	:pointer)
-  (shared	:uchar)
-  (vsm-size	:uchar)
-  (vsm-data	:uchar :count 30))	;; FIXME max-vsm-size
+  (content  :pointer)
+  (shared   :uchar)
+  (vsm-size :uchar)
+  (vsm-data :uchar :count 30))  ;; FIXME max-vsm-size
 
-(defcfun ("zmq_msg_init" msg-init) :int
-  (msg	%msg))
+(defcfun ("zmq_msg_init" %msg-init) :int
+  (msg  %msg))
 
 (defcfun* ("zmq_msg_init_size" %msg-init-size) :int
-  (msg	%msg)
-  (size	:long))
+  (msg  %msg)
+  (size :long))
 
 (defcallback zmq-free :void ((ptr :pointer) (hint :pointer))
   (declare (ignorable hint))
   (excl:aclfree ptr))
 
-(defcfun ("zmq_msg_init_data" msg-init-data) :int
-  (msg	%msg)
-  (data	:pointer)
-  (size	:long)
-  (ffn	:pointer)			; zmq_free_fn
-  (hint	:pointer))
+(defcfun ("zmq_msg_init_data" %msg-init-data) :int
+  (msg  %msg)
+  (data :pointer)
+  (size :long)
+  (ffn  :pointer)           ; zmq_free_fn
+  (hint :pointer))
 
 (defcfun* ("zmq_msg_close" %msg-close) :int
-  (msg	%msg))
+  (msg  %msg))
 
 (defcfun ("zmq_msg_move" %msg-move) :int
-  (dest	%msg)
-  (src	%msg))
+  (dest %msg)
+  (src  %msg))
 
 (defcfun ("zmq_msg_copy" %msg-copy) :int
-  (dest	%msg)
-  (src	%msg))
+  (dest %msg)
+  (src  %msg))
 
 (defcfun ("zmq_msg_data" %msg-data) :pointer
-  (msg	%msg))
+  (msg  %msg))
 
 (defcfun ("zmq_msg_size" %msg-size) :int
-  (msg	%msg))
+  (msg  %msg))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;  0MQ infrastructure (a.k.a. context) initialisation & termination.
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                   0MQ infrastructure - initialisation & termination                   ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(defcfun* ("zmq_init" init) :pointer
-  (io-threads	:int))
+(defcfun* ("zmq_init" %init) :pointer
+  (io-threads   :int))
 
-(defcfun ("zmq_term" term) :int
-  (context	:pointer))
+(defcfun ("zmq_term" %term) :int
+  (context  :pointer))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;  0MQ socket definition.
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                 0MQ socket definition                                 ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defconstant* +p2p+ 0)
 (defconstant* +pub+ 1)
@@ -158,73 +231,75 @@
 (defconstant* +noblock+ 1)
 (defconstant* +sndmore+ 2)
 
-(defcfun* ("zmq_socket" zmq_socket) :pointer
-  (context	:pointer)
-  (type		:int))
+(defcfun* ("zmq_socket" %zmq_socket) :pointer
+  (context  :pointer)
+  (type     :int))
 
-(defcfun ("zmq_close" zmq_close) :int
-  (s	:pointer))
+(defcfun ("zmq_close" %zmq_close) :int
+  (s    :pointer))
 
 (defcfun* ("zmq_setsockopt" %setsockopt) :int
-  (s		:pointer)
-  (option	:int)
-  (optval	:pointer)
-  (optvallen	:long))
+  (s        :pointer)
+  (option   :int)
+  (optval   :pointer)
+  (optvallen    :long))
 
 (defcfun* ("zmq_getsockopt" %getsockopt) :int
-  (s		:pointer)
-  (option	:int)
-  (optval	:pointer)
-  (optvallen	:pointer))
+  (s        :pointer)
+  (option   :int)
+  (optval   :pointer)
+  (optvallen    :pointer))
 
 (defcfun* ("zmq_bind" %bind) :int
-  (s	:pointer)
-  (addr	:pointer :char))
+  (s    :pointer)
+  (addr :pointer :char))
 
 (defcfun* ("zmq_connect" %connect) :int
-  (s	:pointer)
-  (addr	:pointer :char))
+  (s    :pointer)
+  (addr :pointer :char))
 
 
 (defcfun* ("zmq_send" %send) :int
-  (s		:pointer)
-  (msg		%msg)
-  (flags	:int))
+  (s        :pointer)
+  (buf      :pointer :char)
+  (msg      :int)
+  (flags    :int))
 
 (defcfun* ("zmq_recv" %recv) :int
-  (s		:pointer)
-  (msg		%msg)
-  (flags	:int))
+  (s        :pointer)
+  (msg      %msg)
+  (flags    :int))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;  I/O multiplexing.
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                   I/O multiplexing                                    ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defconstant* +pollin+ 1)
 (defconstant* +pollout+ 2)
 (defconstant* +pollerr+ 4)
 
 (defcstruct %pollitem
-  (socket	:pointer)
-  (fd		:int)
-  (events	:short)
-  (revents	:short))
+  (socket   :pointer)
+  (fd       :int)
+  (events   :short)
+  (revents  :short))
 
 (defcfun* ("zmq_poll" %poll) :int
-  (items	:pointer)
-  (nitems	:int)
-  (timeout	:long))
+  (items    :pointer)
+  (nitems   :int)
+  (timeout  :long))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;  Helper functions.
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;                                    Helper functions                                   ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defcfun ("zmq_version" %version) :void
-  (major	:pointer :int)
-  (minor	:pointer :int)
-  (patch	:pointer :int))
+  (major    :pointer :int)
+  (minor    :pointer :int)
+  (patch    :pointer :int))
 
 (defcfun* ("zmq_device" %device) :int
-  (device	:int)
-  (insocket	:pointer)
-  (outsocket	:pointer))
+  (device   :int)
+  (insocket :pointer)
+  (outsocket    :pointer))
+
